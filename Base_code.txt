@@ -1,0 +1,376 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+
+
+
+#X_source, y_source
+
+
+X_target, y_target 
+
+
+x_scaler = StandardScaler()
+X_source = x_scaler.fit_transform(X_source)
+X_target = x_scaler.transform(X_target)
+
+y_scaler_source = StandardScaler()
+y_source = y_scaler_source.fit_transform(y_source)
+
+y_scaler_target = StandardScaler()
+y_target = y_scaler_target.fit_transform(y_target)
+
+
+source_dataset = TensorDataset(torch.from_numpy(X_source), torch.from_numpy(y_source))
+target_dataset = TensorDataset(torch.from_numpy(X_target), torch.from_numpy(y_target))
+
+source_loader = DataLoader(source_dataset, batch_size=32, shuffle=True)
+target_loader = DataLoader(target_dataset, batch_size=32, shuffle=True)
+
+
+class GradientReversalLayer(torch.autograd.Function):
+    """GRL"""
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        output = grad_output.neg() * ctx.alpha
+        return output, None
+
+class FeatureExtractor(nn.Module):
+
+    def __init__(self, input_dim, hidden_dims=[64, 128, 256, 512]):
+        super(FeatureExtractor, self).__init__()
+        layers = []
+        
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(0.2))
+            prev_dim = hidden_dim
+        
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.network(x)
+
+class DomainDiscriminator(nn.Module):
+
+    def __init__(self, input_dim, hidden_dim=512):
+        super(DomainDiscriminator, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, 1),
+            
+        )
+    
+    def forward(self, x):
+        return self.network(x)
+
+class Regressor(nn.Module):
+
+    def __init__(self, input_dim, output_dim, shared_layers=None):
+        super(Regressor, self).__init__()
+        
+        if shared_layers is None:
+           
+            self.shared_layers = nn.Sequential(
+                nn.Linear(input_dim, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(256, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(128, 64),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+            )
+        else:
+            
+            self.shared_layers = shared_layers
+        
+        
+        self.domain_specific_layer = nn.Sequential(
+            nn.Linear(64, output_dim)
+        )
+    
+    def forward(self, x):
+        shared_features = self.shared_layers(x)
+        return self.domain_specific_layer(shared_features)
+
+class BRDANN(nn.Module):
+   
+    def __init__(self, input_dim, output_dim):
+        super(BRDANN, self).__init__()
+        
+        
+        self.feature_extractor = FeatureExtractor(input_dim)
+        
+        
+        self.domain_discriminator = DomainDiscriminator(512)  # 512是特征提取器的输出维度
+        
+        
+        self.shared_regressor_layers = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+        )
+        
+        
+        self.source_regressor = Regressor(64, output_dim, self.shared_regressor_layers)
+        self.target_regressor = Regressor(64, output_dim, self.shared_regressor_layers)
+        
+    def forward(self, x, alpha=1.0):
+        
+        features = self.feature_extractor(x)
+        
+        
+        reversed_features = GradientReversalLayer.apply(features, alpha)
+        domain_output = self.domain_discriminator(reversed_features)
+        
+        
+        shared_features = self.shared_regressor_layers(features)
+        
+       
+        source_pred = self.source_regressor.domain_specific_layer(shared_features)
+        target_pred = self.target_regressor.domain_specific_layer(shared_features)
+        
+        return source_pred, target_pred, domain_output, features
+
+
+def train_brdann(model, source_loader, target_loader, num_epochs=1000):
+    
+    optimizer = optim.Adam(model.parameters(), lr=0.001, betas=(0.5, 0.9))
+    
+    
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.9)
+    
+    
+    regression_loss = nn.MSELoss()
+    
+    
+    losses = {
+        'total': [], 'source_reg': [], 'target_reg': [], 'domain': []
+    }
+    
+    
+    for epoch in range(num_epochs):
+        model.train()
+        
+        total_loss = 0
+        source_reg_loss = 0
+        target_reg_loss = 0
+        domain_loss = 0
+        
+        
+        source_iter = iter(source_loader)
+        target_iter = iter(target_loader)
+        
+        
+        n_batches = min(len(source_loader), len(target_loader))
+        
+        for _ in range(n_batches):
+            
+            try:
+                X_source_batch, y_source_batch = next(source_iter)
+            except StopIteration:
+                source_iter = iter(source_loader)
+                X_source_batch, y_source_batch = next(source_iter)
+                
+            try:
+                X_target_batch, y_target_batch = next(target_iter)
+            except StopIteration:
+                target_iter = iter(target_loader)
+                X_target_batch, y_target_batch = next(target_iter)
+            
+            
+            X_source_batch = X_source_batch.to(device)
+            y_source_batch = y_source_batch.to(device)
+            X_target_batch = X_target_batch.to(device)
+            y_target_batch = y_target_batch.to(device)
+            
+            
+            X_batch = torch.cat([X_source_batch, X_target_batch], dim=0)
+            
+            
+            source_pred, target_pred, domain_output, _ = model(X_batch)
+            
+            
+            batch_size = X_source_batch.size(0)
+            source_pred_source = source_pred[:batch_size]
+            source_pred_target = source_pred[batch_size:]
+            target_pred_source = target_pred[:batch_size]
+            target_pred_target = target_pred[batch_size:]
+            
+            
+            source_reg_loss_val = regression_loss(source_pred_source, y_source_batch)
+            target_reg_loss_val = regression_loss(target_pred_target, y_target_batch)
+            
+            
+            domain_source = domain_output[:batch_size]
+            domain_target = domain_output[batch_size:]
+            
+            
+            domain_loss_val = - (torch.mean(domain_source) - torch.mean(domain_target))
+            
+            
+            lambda_domain = 0.1  
+            loss = source_reg_loss_val + target_reg_loss_val + lambda_domain * domain_loss_val
+            
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            
+            total_loss += loss.item()
+            source_reg_loss += source_reg_loss_val.item()
+            target_reg_loss += target_reg_loss_val.item()
+            domain_loss += domain_loss_val.item()
+        
+        
+        scheduler.step()
+        
+        
+        losses['total'].append(total_loss / n_batches)
+        losses['source_reg'].append(source_reg_loss / n_batches)
+        losses['target_reg'].append(target_reg_loss / n_batches)
+        losses['domain'].append(domain_loss / n_batches)
+        
+        
+        if (epoch + 1) % 100 == 0:
+            print(f'Epoch [{epoch+1}/{num_epochs}], '
+                  f'Total Loss: {total_loss/n_batches:.4f}, '
+                  f'Source Reg: {source_reg_loss/n_batches:.4f}, '
+                  f'Target Reg: {target_reg_loss/n_batches:.4f}, '
+                  f'Domain: {domain_loss/n_batches:.4f}')
+    
+    return losses
+
+
+def evaluate_model(model, X_test, y_test, domain='source'):
+    model.eval()
+    with torch.no_grad():
+        X_test_tensor = torch.from_numpy(X_test).to(device)
+        
+       
+        source_pred, target_pred, _, _ = model(X_test_tensor)
+        
+        if domain == 'source':
+            predictions = source_pred.cpu().numpy()
+        else:
+            predictions = target_pred.cpu().numpy()
+        
+       
+        mse = np.mean((predictions - y_test) ** 2)
+        
+        
+        ss_res = np.sum((y_test - predictions) ** 2)
+        ss_tot = np.sum((y_test - np.mean(y_test, axis=0)) ** 2)
+        r2 = 1 - (ss_res / ss_tot)
+        
+        return mse, r2, predictions
+
+
+if __name__ == "__main__":
+    
+    model = BRDANN(input_dim, output_dim).to(device)
+    
+    
+    
+    losses = train_brdann(model, source_loader, target_loader, num_epochs=1000)
+    
+    
+    plt.figure(figsize=(12, 8))
+    plt.subplot(2, 2, 1)
+    plt.plot(losses['total'])
+    plt.title('Total Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    
+    plt.subplot(2, 2, 2)
+    plt.plot(losses['source_reg'])
+    plt.title('Source Regression Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    
+    plt.subplot(2, 2, 3)
+    plt.plot(losses['target_reg'])
+    plt.title('Target Regression Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    
+    plt.subplot(2, 2, 4)
+    plt.plot(losses['domain'])
+    plt.title('Domain Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    
+    plt.tight_layout()
+    plt.savefig('training_losses.png')
+    plt.show()
+    
+  
+    
+    
+    X_test_source, y_test_source = generate_sample_data(200, input_dim, output_dim, 'source')
+    X_test_source = x_scaler.transform(X_test_source)
+    y_test_source = y_scaler_source.transform(y_test_source)
+    
+    source_mse, source_r2, source_pred = evaluate_model(model, X_test_source, y_test_source, 'source')
+    print(f"MSE: {source_mse:.4f}, R²: {source_r2:.4f}")
+    
+    
+    X_test_target, y_test_target = generate_sample_data(50, input_dim, output_dim, 'target')
+    X_test_target = x_scaler.transform(X_test_target)
+    y_test_target = y_scaler_target.transform(y_test_target)
+    
+    target_mse, target_r2, target_pred = evaluate_model(model, X_test_target, y_test_target, 'target')
+    print(f" MSE: {target_mse:.4f}, R²: {target_r2:.4f}")
+    
+    
+    plt.figure(figsize=(12, 5))
+    
+    
+    
+    
+ 
+    plt.subplot(1, 2, 2)
+    plt.plot(y_test_target[sample_idx], 'b-', label='real')
+    plt.plot(target_pred[sample_idx], 'r--', label='predicted')
+    plt.title('target domain')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig('prediction_examples.png')
+    plt.show()
+    
